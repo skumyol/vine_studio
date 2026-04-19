@@ -21,6 +21,9 @@ FROM mcr.microsoft.com/playwright:v1.49.1-noble AS runner
 
 WORKDIR /app
 
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+
 # Copy package files for production install
 COPY package*.json ./
 
@@ -34,6 +37,7 @@ RUN npx playwright install chromium
 # Copy the built artifacts from the builder stage
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/public ./public
+COPY --from=builder /app/tessdata ./tessdata
 # Copy any other static assets if needed, though vite usually puts them in dist
 
 # Set environment variables

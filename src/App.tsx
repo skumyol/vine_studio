@@ -75,7 +75,7 @@ export default function App() {
   const [vineyard, setVineyard] = useState('');
   const [classification, setClassification] = useState('');
   const [format, setFormat] = useState('Standard (750ml)');
-  const [analyzerMode, setAnalyzerMode] = useState<'gemini' | 'openrouter' | 'deterministic'>('deterministic');
+  const [analyzerMode, setAnalyzerMode] = useState<'vlm' | 'gemini' | 'deterministic'>('vlm');
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [currentResult, setCurrentResult] = useState<AnalysisResult | null>(null);
   const [history, setHistory] = useState<AnalysisResult[]>([]);
@@ -83,6 +83,9 @@ export default function App() {
   const [batchResults, setBatchResults] = useState<AnalysisResult[]>([]);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [batchProgress, setBatchProgress] = useState(0);
+  const [batchStage, setBatchStage] = useState<string>('');
+  const [batchCurrentSku, setBatchCurrentSku] = useState<string>('');
+  const [batchCandidateInfo, setBatchCandidateInfo] = useState<string>('');
 
   const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' }), []);
 
@@ -196,9 +199,9 @@ export default function App() {
 
   const verifyCandidate = async (sku: WineSKU, imageUrl: string, authorityScore: number = 5) => {
     let compositeScore = 0;
-    const scores = { vision: 0, ocr: 0, authority: authorityScore, quality: 0 };
+    const scores = { vision: 0, vlm: 0, ocr: 0, authority: authorityScore, quality: 0 };
     
-    // 1. Quality & OCR (Deterministic Backend)
+    // 1. Quality check (always run via deterministic pre-filter)
     const detRes = await fetch('/api/verify-deterministic', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -209,11 +212,38 @@ export default function App() {
     // Quality (10% weight) - Max 10 pts
     scores.quality = detData.qualityFactor || 0;
     
-    // OCR Match (20% weight) - Max 20 pts
-    if (detData.verdict === 'PASS') scores.ocr = 20;
-    else if (detData.confidence > 0) scores.ocr = (detData.confidence / 100) * 20;
+    // 2. VLM Decision Maker (backend: OCR-hinted Qwen VL verdict)
+    if (analyzerMode === 'vlm') {
+      try {
+        const vlmRes = await fetch('/api/verify-vlm', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sku, imageUrl }),
+        });
+        const vlmData = await vlmRes.json();
 
-    // 2. Vision Audit (Gemini Frontend SDK)
+        // VLM is the decision maker — its confidence + quality is the final score
+        scores.vlm = Math.round((vlmData.confidence || 0) * 0.9);
+        compositeScore = scores.vlm + scores.authority + scores.quality;
+
+        return {
+          pass: vlmData.verdict === 'PASS',
+          confidence: Math.min(Math.round(compositeScore), 100),
+          reasoning: vlmData.reasoning || "VLM verification",
+          meta: scores,
+          vlm_text: vlmData.ocr_hint || "",
+          vlm_decision: vlmData.vlm_decision
+        };
+      } catch (e) {
+        console.error("VLM Error:", e);
+        return { pass: false, confidence: 0, reasoning: "VLM verification failed." };
+      }
+    }
+
+    // Legacy: OCR (Deterministic) - Only 20% weight
+    scores.ocr = detData.verdict === 'PASS' ? 20 : (detData.confidence / 100) * 20;
+
+    // 3. Vision Audit (Gemini Frontend SDK) - Legacy mode
     if (analyzerMode === 'gemini') {
       try {
         // Use proxy to avoid CORS and get base64
@@ -294,6 +324,9 @@ export default function App() {
 
     setIsBatchRunning(true);
     setBatchProgress(0);
+    setBatchStage('Initializing');
+    setBatchCurrentSku('');
+    setBatchCandidateInfo('');
     const results: AnalysisResult[] = [];
 
     for (let i = 0; i < testItems.length; i++) {
@@ -307,7 +340,11 @@ export default function App() {
          format: w.format
        };
 
+       setBatchCurrentSku(`${sku.wine_name} (${sku.vintage})`);
+
        try {
+         setBatchStage(`Searching candidates (${i + 1}/${testItems.length})`);
+         setBatchCandidateInfo('Bing multi-query + vintage-aware ranking');
          const searchRes = await fetch('/api/search', {
            method: 'POST',
            headers: { 'Content-Type': 'application/json' },
@@ -315,17 +352,26 @@ export default function App() {
          });
          const data = await searchRes.json();
          const candidates = data.candidates || [];
-         
+
          const validCandidates = [];
-         // Test top 2 candidates per SKU for the challenge
-         for (const c of candidates.slice(0, 2)) {
+         const topN = Math.min(candidates.length, 5);
+         // Test top 5 candidates per SKU — vintage-correct photo may not be rank #1
+         for (let ci = 0; ci < topN; ci++) {
+            const c = candidates[ci];
+            setBatchStage(`Verifying candidate ${ci + 1}/${topN}`);
+            setBatchCandidateInfo(`${c.domain || 'unknown'} · auth ${c.authority}`);
             const v = await verifyCandidate(sku, c.original, c.authority || 5);
             validCandidates.push({ ...c, ...v });
             if (v.pass) break; // Found a good one!
          }
 
-         const bestCandidate = validCandidates.sort((a,b) => b.confidence - a.confidence)[0];
-         
+         // Prefer any PASS over any non-PASS, then rank by confidence.
+         // Without this, a high-confidence PARTIAL beats a lower-confidence MATCH.
+         const bestCandidate = validCandidates.sort((a, b) => {
+            if (a.pass !== b.pass) return a.pass ? -1 : 1;
+            return b.confidence - a.confidence;
+         })[0];
+
          results.push({
            id: Math.random().toString(36).substring(7),
            input: sku,
@@ -334,7 +380,8 @@ export default function App() {
            selected_image_url: bestCandidate?.original || null,
            explanation: bestCandidate?.reasoning || "No candidate found.",
            candidates: validCandidates,
-           timestamp: new Date().toISOString()
+           timestamp: new Date().toISOString(),
+           user_verified: 'PENDING'
          });
          setBatchResults([...results]);
        } catch (e) {
@@ -342,6 +389,9 @@ export default function App() {
        }
        setBatchProgress(Math.round(((i+1)/testItems.length)*100));
     }
+    setBatchStage('Complete');
+    setBatchCurrentSku('');
+    setBatchCandidateInfo('');
     setIsBatchRunning(false);
   };
 
@@ -566,7 +616,7 @@ export default function App() {
                         <label className="text-[10px] font-black uppercase tracking-widest text-text-sub">Analyzer Engine</label>
                      </div>
                      <div className="flex p-1 bg-bg-app border border-border-subtle rounded-md">
-                        {['deterministic', 'gemini'].map(m => (
+                        {['vlm', 'gemini', 'deterministic'].map(m => (
                           <button 
                             key={m}
                             type="button"
@@ -576,7 +626,7 @@ export default function App() {
                               analyzerMode === m ? "bg-black text-white shadow-lg" : "text-text-sub hover:text-black"
                             )}
                           >
-                            {m === 'deterministic' ? 'STRICT' : 'HYBRID'}
+                            {m === 'vlm' ? 'VLM' : m === 'gemini' ? 'HYBRID' : 'OCR'}
                           </button>
                         ))}
                      </div>
@@ -681,12 +731,14 @@ export default function App() {
                                 </div>
                                 <div className="flex flex-col justify-end">
                                    <div className="flex gap-1 h-3 mb-2 bg-bg-app border border-border-subtle rounded-full overflow-hidden">
-                                      <div className="h-full bg-accent-wine-vibrant transition-all" style={{ width: `${currentResult.meta?.vision || 0}%` }} title="Vision Domain" />
+                                      <div className="h-full bg-purple-600 transition-all" style={{ width: `${currentResult.meta?.vlm || 0}%` }} title="VLM Text Extraction" />
+                                      <div className="h-full bg-accent-wine-vibrant transition-all" style={{ width: `${currentResult.meta?.vision || 0}%` }} title="Vision Audit" />
                                       <div className="h-full bg-black transition-all" style={{ width: `${currentResult.meta?.ocr || 0}%` }} title="OCR Domain" />
                                       <div className="h-full bg-success-green transition-all" style={{ width: `${currentResult.meta?.authority || 0}%` }} title="Source Authority" />
                                       <div className="h-full bg-blue-500 transition-all" style={{ width: `${currentResult.meta?.quality || 0}%` }} title="Visual Quality" />
                                    </div>
                                    <div className="flex justify-between font-mono text-[8px] uppercase tracking-tighter text-text-sub">
+                                      <span>L:{currentResult.meta?.vlm}</span>
                                       <span>V:{currentResult.meta?.vision}</span>
                                       <span>O:{currentResult.meta?.ocr}</span>
                                       <span>A:{currentResult.meta?.authority}</span>
@@ -997,7 +1049,7 @@ export default function App() {
                     <div className="flex flex-wrap gap-4 items-center">
                        <p className="text-text-sub font-mono text-xs uppercase tracking-widest border-r border-border-subtle pr-4">Target: 90% Accuracy</p>
                        <p className="text-text-sub font-mono text-xs uppercase tracking-widest border-r border-border-subtle pr-4">SKUs: 10 Challenge Targets</p>
-                       <p className="text-text-sub font-mono text-xs uppercase tracking-widest">Model: Gemini 3 Flash Vision</p>
+                       <p className="text-text-sub font-mono text-xs uppercase tracking-widest">Engine: {analyzerMode === 'vlm' ? 'Qwen 3.5 VL + OCR Hint' : analyzerMode === 'gemini' ? 'Gemini + OCR Hybrid' : 'Tesseract OCR (Strict)'}</p>
                     </div>
                   </div>
                   <button 
@@ -1025,16 +1077,16 @@ export default function App() {
                     </div>
                     <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-6">
                        <div className="bg-white p-4 border border-border-subtle">
-                          <div className="text-[10px] font-black uppercase text-text-sub mb-1">Status</div>
-                          <div className="font-display text-xl uppercase italic">Analyzing labels</div>
+                          <div className="text-[10px] font-black uppercase text-text-sub mb-1">Stage</div>
+                          <div className="font-display text-xl uppercase italic truncate">{batchStage || 'Idle'}</div>
                        </div>
                        <div className="bg-white p-4 border border-border-subtle">
-                          <div className="text-[10px] font-black uppercase text-text-sub mb-1">OCR Buffer</div>
-                          <div className="font-mono text-xs opacity-50 truncate">Playwright crawling DuckDuckGo...</div>
+                          <div className="text-[10px] font-black uppercase text-text-sub mb-1">Current SKU</div>
+                          <div className="font-mono text-xs opacity-70 truncate">{batchCurrentSku || '—'}</div>
                        </div>
                        <div className="bg-white p-4 border border-border-subtle">
-                          <div className="text-[10px] font-black uppercase text-text-sub mb-1">Efficiency</div>
-                          <div className="font-display text-xl uppercase italic">Parallel verification</div>
+                          <div className="text-[10px] font-black uppercase text-text-sub mb-1">Candidate</div>
+                          <div className="font-mono text-xs opacity-70 truncate">{batchCandidateInfo || '—'}</div>
                        </div>
                     </div>
                   </div>

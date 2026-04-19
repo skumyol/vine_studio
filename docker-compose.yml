@@ -10,18 +10,30 @@ services:
       - "3000:3000"
     environment:
       - NODE_ENV=production
+      - PORT=3000
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - SERPAPI_KEY=${SERPAPI_KEY}
-    restart: always
-    # Uncomment if you want to use a volume for local logs or data
-    # volumes:
-    #   - ./logs:/app/logs
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - APP_URL=${APP_URL:-http://localhost:3000}
+    restart: unless-stopped
+    # Persist wine catalog data between restarts
+    volumes:
+      - wine-data:/app/public/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+volumes:
+  wine-data:
 
 networks:
   default:

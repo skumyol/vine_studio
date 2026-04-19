@@ -57,40 +57,87 @@ function normalizeText(text: string): string {
 }
 
 // B. Visual Pre-Filter (Tier 2 - Classical CV Heuristics)
+// Gates in order of cheapest → most expensive. All pure sharp (no extra deps).
 async function visualPreFilter(buffer: Buffer): Promise<{ pass: boolean; reason: string; qualityFactor: number }> {
   try {
     const metadata = await sharp(buffer).metadata();
-    
-    // 1. Resolution Check
-    if ((metadata.width || 0) < 300 || (metadata.height || 0) < 400) {
+    const W = metadata.width || 0;
+    const H = metadata.height || 0;
+
+    // 1. Resolution gate
+    if (W < 300 || H < 400) {
       return { pass: false, reason: "Resolution too low for professional verification.", qualityFactor: 0 };
     }
 
-    // 2. Aspect Ratio (Upright bottle check)
-    const ratio = (metadata.height || 0) / (metadata.width || 0);
-    if (ratio < 0.75) {
-      return { pass: false, reason: "Horizontal aspect ratio (Not a product bottle shot).", qualityFactor: 2 };
+    // 2. Aspect ratio — many retailers (Shopify etc.) host square 1:1 packshots of bottles on white.
+    //    Only reject clearly horizontal/landscape images. Square is acceptable; tall portrait is preferred.
+    const ratio = H / W;
+    if (ratio < 0.85) {
+      return { pass: false, reason: `Landscape aspect (${ratio.toFixed(2)}:1) — not a bottle shot.`, qualityFactor: 0 };
     }
 
-    // 3. Studio Background Detection (Heuristic)
-    // Most professional shots have light backgrounds. We check if corners are bright.
-    const { data: corners } = await sharp(buffer)
-      .extract({ left: 0, top: 0, width: 20, height: 20 })
-      .toBuffer({ resolveWithObject: true });
-    
-    // 4. Blur Detection (Laplacian Variance Proxy)
+    // 3. Background cleanness — sample 4 corners, each 24×24.
+    //    A clean packshot has bright, uniform corners (white/cream/grey studio).
+    const cornerSize = 24;
+    const corners = await Promise.all([
+      sharp(buffer).extract({ left: 0, top: 0, width: cornerSize, height: cornerSize }).greyscale().stats(),
+      sharp(buffer).extract({ left: W - cornerSize, top: 0, width: cornerSize, height: cornerSize }).greyscale().stats(),
+      sharp(buffer).extract({ left: 0, top: H - cornerSize, width: cornerSize, height: cornerSize }).greyscale().stats(),
+      sharp(buffer).extract({ left: W - cornerSize, top: H - cornerSize, width: cornerSize, height: cornerSize }).greyscale().stats()
+    ]);
+    const cornerMeans = corners.map(s => s.channels[0].mean);
+    const cornerStdevs = corners.map(s => s.channels[0].stdev);
+    const avgCornerMean = cornerMeans.reduce((a, b) => a + b, 0) / 4;
+    const maxCornerStdev = Math.max(...cornerStdevs);
+    const meanSpread = Math.max(...cornerMeans) - Math.min(...cornerMeans);
+
+    // Background penalty (soft — reduces qualityFactor but doesn't reject outright)
+    let bgPenalty = 0;
+    if (avgCornerMean < 80) bgPenalty += 3; // very dark bg (night shot / restaurant scene)
+    if (maxCornerStdev > 40) bgPenalty += 3; // busy/textured bg (lifestyle shot with props)
+    if (meanSpread > 60) bgPenalty += 2; // non-uniform lighting (not studio)
+    const cleanBg = bgPenalty === 0;
+
+    // Reject lifestyle/scene shots outright when all three background signals trip
+    if (avgCornerMean < 60 && maxCornerStdev > 45 && meanSpread > 70) {
+      return { pass: false, reason: "Busy non-studio background (lifestyle/scene shot).", qualityFactor: 1 };
+    }
+
+    // 4. Blur detection — Laplacian variance proxy via sharp convolve.
+    //    Low variance of edge response = blurry. Run on a downsampled copy for speed.
+    const laplacianKernel = {
+      width: 3, height: 3,
+      kernel: [0, 1, 0, 1, -4, 1, 0, 1, 0]
+    };
+    const edgeStats = await sharp(buffer)
+      .resize({ width: 400, withoutEnlargement: false })
+      .greyscale()
+      .convolve(laplacianKernel)
+      .stats();
+    const edgeVariance = edgeStats.channels[0].stdev ** 2;
+
+    // 5. Overall contrast — used for composite scoring.
     const stats = await sharp(buffer).stats();
     const avgStdDev = stats.channels.reduce((acc, c) => acc + c.stdev, 0) / stats.channels.length;
-    
-    let qualityFactor = 10;
-    if (avgStdDev < 20) qualityFactor = 5;
-    if (avgStdDev < 12) qualityFactor = 2;
 
-    if (avgStdDev < 10) {
-      return { pass: false, reason: "Image exceeds blur/out-of-focus tolerance.", qualityFactor };
+    // Blur hard-fail
+    if (edgeVariance < 30 || avgStdDev < 10) {
+      return { pass: false, reason: `Image exceeds blur tolerance (edge var ${edgeVariance.toFixed(0)}, stddev ${avgStdDev.toFixed(1)}).`, qualityFactor: 0 };
     }
 
-    return { pass: true, reason: "Visual quality verified.", qualityFactor };
+    // Composite quality factor (0–10)
+    let qualityFactor = 10;
+    if (avgStdDev < 20) qualityFactor -= 3;
+    if (avgStdDev < 12) qualityFactor -= 3;
+    if (edgeVariance < 80) qualityFactor -= 2; // soft-focus
+    if (ratio < 1.1) qualityFactor -= 1; // square — acceptable but tall bottle shots preferred
+    qualityFactor = Math.max(qualityFactor - bgPenalty, 0);
+
+    return {
+      pass: true,
+      reason: `Visual OK (ratio ${ratio.toFixed(2)}, edge var ${edgeVariance.toFixed(0)}, cleanBg=${cleanBg}).`,
+      qualityFactor
+    };
   } catch (error) {
     return { pass: false, reason: "Image file corruption or restricted access.", qualityFactor: 0 };
   }
@@ -116,31 +163,10 @@ async function verifyDeterministic(sku: WineSKU, imageUrl: string) {
       };
     }
 
-    // 2. Tier 3 - OCR Extraction (Unified Full + Label Crops)
-    const worker = await createWorker('eng');
-    
-    // FULL IMAGE OCR
-    const fullRes = await worker.recognize(buffer);
-    
-    // LABEL CROP (Center-Bottom heuristic for bottles)
-    const metadata = await sharp(buffer).metadata();
-    const cropWidth = Math.round((metadata.width || 0) * 0.7);
-    const cropHeight = Math.round((metadata.height || 0) * 0.4);
-    const cropLeft = Math.round(((metadata.width || 0) - cropWidth) / 2);
-    const cropTop = Math.round((metadata.height || 0) * 0.45); // Labels are usually in the middle-bottom
-    
-    const labelBuffer = await sharp(buffer)
-      .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
-      .grayscale()
-      .normalize()
-      .sharpen()
-      .toBuffer();
-      
-    const labelRes = await worker.recognize(labelBuffer);
-    
-    const combinedOCR = normalizeText(fullRes.data.text + " " + labelRes.data.text);
-    await worker.terminate();
-    
+    // 2. Tier 3 - OCR Extraction (multi-lang, upscaled, preprocessed — see runOCR)
+    const rawOCR = await runOCR(buffer);
+    const combinedOCR = normalizeText(rawOCR);
+
     console.log(`[Combined OCR Output]: ${combinedOCR}`);
 
     const targetProducer = normalizeText(sku.wine_name);
@@ -240,124 +266,207 @@ async function verifyDeterministic(sku: WineSKU, imageUrl: string) {
   }
 }
 
-// D. Playwright Search (Default - Masquerades as Brave/Chrome for scraping)
+// D. Playwright Search (Bing Images - reliable image scraping)
 async function playwrightSearch(sku: WineSKU) {
   const TRUSTED_DOMAINS = [
-    'wine-searcher.com', 'vivino.com', 'millesima.com', 'idealwine.com', 'wine.com', 
-    'cellartracker.com', 'bbr.com', 'vins-etonnants.com', 'vinatis.com'
+    'wine-searcher.com', 'vivino.com', 'millesima.com', 'idealwine.com', 'wine.com',
+    'cellartracker.com', 'bbr.com', 'vinatis.com', 'klwines.com', 'totalwine.com',
+    'decanter.com', 'wineaccess.com', 'berrybros.com'
   ];
-  const BAD_DOMAINS = ['pinterest.com', 'shutterstock.com', 'stock.adobe.com', 'alamy.com', 'ebay.com', 'facebook.com', 'instagram.com'];
-  const allCandidates: any[] = [];
-  
+  const BAD_DOMAINS = ['pinterest.com', 'shutterstock.com', 'alamy.com', 'facebook.com',
+    'instagram.com', 'twitter.com', 'x.com', 'tiktok.com'];
+
+  const candidates: any[] = [];
+  const vintage = (sku.vintage || '').toString();
+  const isNV = !vintage || /^nv$/i.test(vintage);
+
+  // Multi-query strategy: quoted SKU + vintage, vintage-first, then vineyard focus
+  const queries: string[] = [];
+  if (isNV) {
+    queries.push(`"${sku.wine_name}" NV bottle`);
+    queries.push(`${sku.wine_name} NV wine bottle front label`);
+  } else {
+    queries.push(`"${sku.wine_name}" "${vintage}" bottle`);
+    queries.push(`${vintage} ${sku.wine_name} wine bottle front label`);
+    if (sku.vineyard) queries.push(`"${sku.vineyard}" "${vintage}" ${sku.wine_name.split(' ').slice(0, 2).join(' ')} bottle`);
+  }
+
+  // Token set for title-match scoring
+  const targetTokens = sku.wine_name
+    .toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(t => t.length > 2);
+
   try {
-    const browser = await chromium.launch({ 
+    const browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox']
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled']
     });
-    
+
     try {
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-      });
-      
-      const query = `${sku.wine_name} ${sku.vintage} wine bottle shot`;
-      console.log(`[DeepRetrieval] Starting: ${query}`);
-      
-      const searchPage = await context.newPage();
-      // Using Bing as recommended in the plan for cleaner scraping
-      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
-      await searchPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-      
-      // Dismiss popups heuristic from plan
-      await searchPage.evaluate(() => {
-        const buttons = Array.from(document.querySelectorAll('button, a'));
-        const closeBtn = buttons.find(b => /accept|agree|allow|close|dismiss/i.test(b.textContent || ''));
-        if (closeBtn instanceof HTMLElement) closeBtn.click();
+        viewport: { width: 1920, height: 1080 },
+        locale: 'en-US'
       });
 
-      // Extract search result links
-      const resultLinks = await searchPage.evaluate(({ trusted, bad }) => {
-        const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
-        const seen = new Set();
-        return anchors.map(a => {
-          const url = a.getAttribute('href') || '';
-          const hostname = new URL(url).hostname.replace('www.', '');
-          if (seen.has(url)) return null;
-          if (hostname.includes('bing.com') || hostname.includes('microsoft.com')) return null;
-          if (bad.some(d => hostname.includes(d))) return null;
-          seen.add(url);
-          
-          let score = 5;
-          if (trusted.some(d => hostname.includes(d))) score = 10;
-          return { url, domain: hostname, score };
-        }).filter(r => r !== null).slice(0, 6); // Top 6 leads
-      }, { trusted: TRUSTED_DOMAINS, bad: BAD_DOMAINS });
-
-      await searchPage.close();
-
-      // Deep Crawl Top Leads (Concurrency limit 3)
-      const leads = resultLinks as any[];
-      for (const lead of leads) {
-        console.log(`[DeepRetrieval] Crawling Lead: ${lead.domain}`);
+      // Fire Bing queries sequentially (avoid rate limits)
+      for (const query of queries) {
+        console.log(`[Search] Bing: ${query}`);
         const page = await context.newPage();
         try {
-          await page.goto(lead.url, { waitUntil: 'domcontentloaded', timeout: 12000 });
-          
-          const images = await page.evaluate(({ domain, authority }) => {
-            const imgs = Array.from(document.querySelectorAll('img'));
-            return imgs.map((img, i) => {
-              const src = img.getAttribute('src') || img.getAttribute('data-src');
-              if (!src || src.startsWith('data:') || src.length < 10) return null;
-              
-              const width = img.naturalWidth || parseInt(img.getAttribute('width') || '0');
-              const height = img.naturalHeight || parseInt(img.getAttribute('height') || '0');
-              const alt = (img.getAttribute('alt') || '').toLowerCase();
-              const urlLower = src.toLowerCase();
+          const bingUrl = `https://www.bing.com/images/search?q=${encodeURIComponent(query)}&form=HDRSC2&first=1`;
+          await page.goto(bingUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await page.waitForTimeout(2000);
 
-              // Scoring heuristic from Python Plan
-              let score = authority;
-              if (height > width) score += 3; // Prefer vertical bottle shots
-              if (height > 500) score += 2;
-              
-              const hints = ['bottle', 'wine', 'vin', 'product', 'label'];
-              if (hints.some(h => alt.includes(h) || urlLower.includes(h))) score += 3;
+          const bingImages = await page.evaluate(({ trusted, bad }) => {
+            const results: any[] = [];
+            const seen = new Set();
+            const tiles = document.querySelectorAll('a.iusc');
+            tiles.forEach((tile) => {
+              try {
+                const mAttr = tile.getAttribute('m');
+                if (!mAttr) return;
+                const meta = JSON.parse(mAttr);
+                const imgUrl = meta.murl;
+                const pageUrl = meta.purl;
+                const title = meta.t || '';
+                if (!imgUrl || seen.has(imgUrl)) return;
+                seen.add(imgUrl);
 
-              // Absolute URL resolution
-              let finalSrc = src;
-              if (finalSrc.startsWith('//')) finalSrc = 'https:' + finalSrc;
-              else if (finalSrc.startsWith('/')) finalSrc = window.location.origin + finalSrc;
+                let domain = 'unknown';
+                try { domain = new URL(pageUrl || imgUrl).hostname.replace('www.', ''); } catch (e) {}
+                if (bad.some((d: string) => domain.includes(d))) return;
 
-              return {
-                original: finalSrc,
-                title: img.getAttribute('alt') || 'Wine Bottle',
-                domain: domain,
-                authority: score,
-                source: 'Deep Crawl'
-              };
-            }).filter(img => img !== null).sort((a,b) => b.authority - a.authority).slice(0, 3);
-          }, { domain: lead.domain, authority: lead.score });
+                let score = 5;
+                if (trusted.some((d: string) => domain.includes(d))) score = 10;
+                results.push({
+                  original: imgUrl,
+                  pageUrl,
+                  title: title || 'Wine bottle',
+                  domain,
+                  authority: score,
+                  source: 'Bing Images',
+                  width: meta.mw,
+                  height: meta.mh
+                });
+              } catch (e) {}
+            });
+            return results.slice(0, 20);
+          }, { trusted: TRUSTED_DOMAINS, bad: BAD_DOMAINS });
 
-          if (images) allCandidates.push(...images);
+          if (bingImages?.length) {
+            candidates.push(...bingImages);
+            console.log(`[Search]   +${bingImages.length} from Bing`);
+          }
         } catch (e) {
-          console.warn(`[DeepRetrieval] Lead ${lead.domain} failed:`, e);
+          console.log('[Search] Bing error:', (e as Error).message);
         } finally {
           await page.close();
         }
-        if (allCandidates.some(c => c.authority >= 15)) break; // Found a high-confidence high-res link
+        if (candidates.length >= 25) break; // enough to score
       }
+
+      // Google fallback only if Bing was weak
+      if (candidates.length < 5) {
+        const gPage = await context.newPage();
+        try {
+          const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(queries[0])}&tbm=isch&safe=active`;
+          await gPage.goto(googleUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await gPage.waitForTimeout(2500);
+
+          const googleImages = await gPage.evaluate(({ trusted, bad }) => {
+            const results: any[] = [];
+            const seen = new Set();
+            const imgs = document.querySelectorAll('img[src^="https"], img[data-src^="https"]');
+            imgs.forEach((img) => {
+              const src = (img as HTMLImageElement).src || img.getAttribute('data-src');
+              if (!src || src.length < 20 || seen.has(src)) return;
+              if (src.includes('gstatic.com') || src.includes('google.com/logos')) return;
+              seen.add(src);
+              let domain = 'google-images';
+              try { domain = new URL(src).hostname.replace('www.', ''); } catch (e) {}
+              if (bad.some((d: string) => domain.includes(d))) return;
+              let score = 4;
+              if (trusted.some((d: string) => domain.includes(d))) score = 9;
+              results.push({
+                original: src,
+                pageUrl: '',
+                title: (img as HTMLImageElement).alt || 'Wine bottle',
+                domain,
+                authority: score,
+                source: 'Google Images'
+              });
+            });
+            return results.slice(0, 10);
+          }, { trusted: TRUSTED_DOMAINS, bad: BAD_DOMAINS });
+
+          if (googleImages?.length) candidates.push(...googleImages);
+        } catch (e) {
+          console.log('[Search] Google error:', (e as Error).message);
+        } finally {
+          await gPage.close();
+        }
+      }
+
     } finally {
       await browser.close().catch(() => {});
     }
 
-    console.log(`[DeepRetrieval] Found ${allCandidates.length} potential images.`);
-    return allCandidates
-      .sort((a, b) => b.authority - a.authority)
-      .filter((r, i, self) => r.original && self.findIndex(t => t.original === r.original) === i);
-
   } catch (error: any) {
-    console.error("[DeepRetrieval] Failure:", error.message);
-    return [];
+    console.error('[Search] Playwright error:', error.message);
   }
+
+  // Rescore: vintage match in URL/title is heavily weighted, wrong vintage is penalized
+  const vintageRegex = /\b(19|20)\d{2}\b/g;
+  const scored = candidates.map(c => {
+    const haystack = `${c.title || ''} ${c.pageUrl || ''} ${c.original || ''}`.toLowerCase();
+    let score = c.authority;
+
+    // Aspect ratio preference
+    if (c.width && c.height) {
+      if (c.height > c.width) score += 2;
+      if (c.width >= 400 || c.height >= 600) score += 1;
+      if (c.width < 200 || c.height < 250) score -= 3;
+    }
+
+    // Vintage-aware scoring
+    if (!isNV) {
+      if (haystack.includes(vintage)) {
+        score += 8; // strong boost for correct vintage
+      } else {
+        const detected = Array.from(haystack.match(vintageRegex) || [])
+          .map(y => String(y))
+          .filter(y => y !== vintage && Number(y) >= 1950 && Number(y) <= new Date().getFullYear());
+        if (detected.length > 0) score -= 6; // penalize wrong vintage
+      }
+    } else if (/\bnv\b|non[- ]vintage/.test(haystack)) {
+      score += 4;
+    }
+
+    // Token-match on wine name
+    const hits = targetTokens.filter(t => haystack.includes(t)).length;
+    score += Math.min(hits, 5);
+
+    // Bottle-shape hint
+    if (/bottle|label/.test(haystack)) score += 1;
+
+    return { ...c, authority: score };
+  });
+
+  const unique = scored
+    .filter((r, i, self) =>
+      r.original &&
+      r.original.startsWith('http') &&
+      self.findIndex(t => t.original === r.original) === i
+    )
+    .sort((a, b) => b.authority - a.authority)
+    .slice(0, 10);
+
+  console.log(`[Search] Returning ${unique.length} ranked candidates (vintage=${vintage || 'NV'})`);
+  unique.slice(0, 3).forEach((c, i) => console.log(`[Search]   #${i + 1} [${c.authority}] ${c.domain} — ${c.title?.slice(0, 80)}`));
+  return unique;
 }
 
 // E. Search Service Orchestrator
@@ -441,7 +550,7 @@ async function verifyWithOpenRouter(sku: WineSKU, imageUrl: string) {
     Respond in JSON: {"pass": boolean, "confidence": number, "reasoning": "string"}`;
 
     const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-      model: "qwen/qwen-2.5-vl-72b-instruct:free",
+      model: "qwen/qwen3.5-27b",
       messages: [
         {
           role: "user",
@@ -467,7 +576,279 @@ async function verifyWithOpenRouter(sku: WineSKU, imageUrl: string) {
   }
 }
 
-// G. Gemini Vision Audit (REMOVED - USE FRONTEND SDK)
+// G. VLM Text Extraction (Qwen-VL) - Replaces OCR for better accuracy
+async function extractTextWithVLM(imageUrl: string): Promise<{ text: string; structured: any }> {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) {
+    throw new Error("OpenRouter API Key not configured for VLM extraction");
+  }
+
+  const prompt = `Extract all readable text from this wine bottle label image. 
+  Focus on: producer name, vintage year, appellation, vineyard/climat, classification (Grand Cru, 1er Cru, etc.).
+  Return JSON format: { "full_text": "all text concatenated", "producer": "...", "vintage": "...", "appellation": "...", "vineyard": "...", "classification": "..." }`;
+
+  try {
+    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model: "qwen/qwen3.5-27b",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            { type: "image_url", image_url: { url: imageUrl } }
+          ]
+        }
+      ],
+      response_format: { type: "json_object" }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
+        'X-Title': 'VinoBuzz VLM Extraction'
+      },
+      timeout: 30000
+    });
+
+    const result = JSON.parse(response.data.choices[0].message.content);
+    const fullText = result.full_text || [
+      result.producer,
+      result.vintage,
+      result.appellation,
+      result.vineyard,
+      result.classification
+    ].filter(Boolean).join(' ');
+
+    return { text: fullText, structured: result };
+  } catch (error: any) {
+    console.error("VLM extraction error:", error.response?.data || error.message);
+    throw new Error("VLM text extraction failed");
+  }
+}
+
+// OCR worker singleton — expensive to init, keep one per process
+let ocrWorker: any = null;
+const TESSDATA_PATH = path.join(process.cwd(), 'tessdata');
+async function getOCRWorker() {
+  if (ocrWorker) return ocrWorker;
+  ocrWorker = await createWorker(['eng', 'fra', 'ita', 'deu'], 1, {
+    langPath: TESSDATA_PATH,
+    cachePath: TESSDATA_PATH,
+    gzip: false
+  });
+  // Tune parameters for wine labels: single block, high DPI hint
+  await ocrWorker.setParameters({
+    tessedit_pageseg_mode: '3', // Auto layout — handles varied wine label geometries
+    preserve_interword_spaces: '1',
+    user_defined_dpi: '300'
+  });
+  return ocrWorker;
+}
+
+// H1. Quick OCR — Tesseract with multi-lang + adaptive preprocessing (NO hard threshold)
+async function runOCR(buffer: Buffer): Promise<string> {
+  try {
+    const worker = await getOCRWorker();
+    const metadata = await sharp(buffer).metadata();
+    const W = metadata.width || 0;
+    const H = metadata.height || 0;
+
+    // Skip absurdly small images — nothing to OCR
+    if (W < 120 || H < 120) return "";
+
+    // Upscale small images — Tesseract needs ~300dpi equivalent. Use Lanczos for quality.
+    const targetWidth = Math.max(W * 2, 1400);
+
+    // Pass 1: Full image, grayscale + CLAHE-style normalize + sharpen. NO threshold.
+    const fullPre = await sharp(buffer)
+      .resize({ width: targetWidth, withoutEnlargement: false, kernel: 'lanczos3' })
+      .grayscale()
+      .normalize({ lower: 2, upper: 98 }) // contrast stretch, clip 2% tails
+      .sharpen({ sigma: 1.0 })
+      .toBuffer();
+
+    // Pass 2: Label crop (center, looser vertical range 20-75% — covers both top and center labels)
+    const cropWidth = Math.round(W * 0.8);
+    const cropHeight = Math.round(H * 0.55);
+    const cropLeft = Math.round((W - cropWidth) / 2);
+    const cropTop = Math.round(H * 0.2);
+    const labelPre = await sharp(buffer)
+      .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
+      .resize({ width: Math.max(cropWidth * 3, 1600), kernel: 'lanczos3' })
+      .grayscale()
+      .normalize({ lower: 2, upper: 98 })
+      .sharpen({ sigma: 1.5 })
+      .toBuffer();
+
+    // Pass 3: Inverted variant — catches light-text-on-dark-label bottles (e.g. Rayas, some Champagnes)
+    const invertedPre = await sharp(buffer)
+      .resize({ width: targetWidth, withoutEnlargement: false, kernel: 'lanczos3' })
+      .grayscale()
+      .normalize({ lower: 2, upper: 98 })
+      .negate()
+      .sharpen({ sigma: 1.0 })
+      .toBuffer();
+
+    const [fullRes, labelRes, invRes] = await Promise.all([
+      worker.recognize(fullPre),
+      worker.recognize(labelPre),
+      worker.recognize(invertedPre)
+    ]);
+
+    // Pick the pass with the most alphabetic content (reject garbage)
+    const texts = [fullRes.data.text, labelRes.data.text, invRes.data.text].map(t => t || '');
+    const alphaCount = (t: string) => (t.match(/[A-Za-zÀ-ÿ]{3,}/g) || []).length;
+    texts.sort((a, b) => alphaCount(b) - alphaCount(a));
+
+    const combined = texts.join(' ')
+      .replace(/[\u0000-\u001F]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return combined;
+  } catch (e: any) {
+    console.error('[OCR] Error:', e.message);
+    return "";
+  }
+}
+
+// H2. VLM Decision Maker - takes OCR hint + target SKU and renders final verdict
+async function vlmDecide(sku: WineSKU, imageUrl: string, ocrHint: string) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) throw new Error("OpenRouter API Key not configured");
+
+  const prompt = `You are verifying whether a wine bottle photo matches a target SKU. You are the FINAL DECISION MAKER.
+
+TARGET SKU:
+- Wine name: ${sku.wine_name}
+- Vintage: ${sku.vintage}
+- Appellation: ${sku.appellation || 'N/A'}
+- Vineyard/Climat: ${sku.vineyard || 'N/A'}
+- Classification: ${sku.classification || 'N/A'}
+- Region: ${sku.region || 'N/A'}
+
+OCR HINT (noisy Tesseract output from the image, use as evidence — producers often appear as owner names or domaine variations):
+"""
+${ocrHint.slice(0, 500)}
+"""
+
+INSTRUCTIONS:
+1. Read the label in the image directly (do not rely solely on the OCR).
+2. Treat owner/producer name variants as matches (e.g., "Stéphane Robert" = "Domaine du Tunnel", "Colette Faller" = "Domaine Weinbach").
+3. VINTAGE is critical — if a different year is clearly visible, it is NO_MATCH. "NV" matches non-vintage champagnes.
+4. APPELLATION + VINEYARD/CLIMAT must align with the target (Burgundy climats are strict — "Latricières" ≠ "Mazis").
+5. Reject lifestyle shots, watermarks, stock images, or images where the label is not readable.
+
+Return strict JSON:
+{
+  "verdict": "MATCH" | "PARTIAL" | "NO_MATCH",
+  "confidence": 0-100,
+  "matched_fields": { "producer": boolean, "vintage": boolean, "appellation": boolean, "vineyard": boolean },
+  "detected": { "producer": "string", "vintage": "string", "appellation": "string", "vineyard": "string" },
+  "has_watermark": boolean,
+  "is_professional": boolean,
+  "reasoning": "one concise sentence explaining the verdict"
+}`;
+
+  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+    model: "qwen/qwen3.5-27b",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: imageUrl } }
+      ]
+    }],
+    response_format: { type: "json_object" }
+  }, {
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
+      'X-Title': 'VinoBuzz VLM Decision'
+    },
+    timeout: 45000
+  });
+
+  return JSON.parse(response.data.choices[0].message.content);
+}
+
+// H. VLM-Based Verification (VLM is the final decision maker, OCR provides hint context)
+async function verifyWithVLM(sku: WineSKU, imageUrl: string) {
+  console.log(`[VLM Verify] Analyzing image: ${imageUrl}`);
+
+  try {
+    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
+    const buffer = Buffer.from(response.data);
+
+    // 1. Visual Pre-Filter (only absolute rejects — too blurry / wrong aspect)
+    const preFilter = await visualPreFilter(buffer);
+    if (!preFilter.pass) {
+      return {
+        pass: false,
+        confidence: 0,
+        verdict: 'FAIL',
+        reasoning: `VISUAL REJECT: ${preFilter.reason}`,
+        ocr_hint: "",
+        vlm_decision: null
+      };
+    }
+
+    // 2. OCR (as evidence / hint, NOT a gate)
+    const ocrHint = await runOCR(buffer);
+    console.log(`[OCR Hint]: ${ocrHint.slice(0, 200)}`);
+
+    // 3. VLM final decision
+    const decision = await vlmDecide(sku, imageUrl, ocrHint);
+    console.log(`[VLM Decision]:`, decision);
+
+    // Strict gates — VLM's own verdicts
+    if (decision.has_watermark) {
+      return {
+        pass: false,
+        confidence: Math.min(decision.confidence, 30),
+        verdict: 'FAIL',
+        reasoning: `Watermark detected: ${decision.reasoning}`,
+        ocr_hint: ocrHint,
+        vlm_decision: decision,
+        qualityFactor: preFilter.qualityFactor
+      };
+    }
+
+    // Score composition — VLM confidence is the backbone (×0.9), quality 0–10, soft penalty for unprofessional shots.
+    // Classical preFilter already rejected truly bad images (blur/aspect/bg). Don't double-gate on VLM's professional
+    // opinion — it would block legitimate CellarTracker / retailer label-only crops that are perfect identity matches.
+    const profPenalty = decision.is_professional === false ? 5 : 0;
+    const finalScore = Math.min(
+      Math.max(Math.round((decision.confidence || 0) * 0.9) + (preFilter.qualityFactor || 0) - profPenalty, 0),
+      100
+    );
+
+    // PASS criteria: VLM says MATCH + score clears bar + no watermark.
+    // Trust classical preFilter for studio-quality judgment (already passed at this point).
+    const finalPass =
+      decision.verdict === 'MATCH' &&
+      finalScore >= 70;
+
+    return {
+      pass: finalPass,
+      confidence: finalScore,
+      verdict: finalPass ? 'PASS' : 'FAIL',
+      reasoning: decision.reasoning || `VLM verdict: ${decision.verdict}`,
+      ocr_hint: ocrHint,
+      vlm_decision: decision,
+      qualityFactor: preFilter.qualityFactor
+    };
+
+  } catch (error: any) {
+    console.error("[VLM Verify] Error:", error.message);
+    return {
+      pass: false,
+      confidence: 0,
+      verdict: 'FAIL',
+      reasoning: `VLM verification failed: ${error.message}`,
+      ocr_hint: "",
+      vlm_decision: null
+    };
+  }
+}
 
 // --- API ROUTES ---
 
@@ -506,6 +887,17 @@ app.post('/api/verify-deterministic', async (req, res) => {
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: "Deterministic verification failed" });
+  }
+});
+
+app.post('/api/verify-vlm', async (req, res) => {
+  const { sku, imageUrl } = req.body;
+  try {
+    const result = await verifyWithVLM(sku, imageUrl);
+    res.json(result);
+  } catch (error: any) {
+    console.error("VLM verification route error:", error.message);
+    res.status(500).json({ error: "VLM verification failed", reasoning: error.message });
   }
 });
 
