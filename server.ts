@@ -23,6 +23,11 @@ const PORT = 3000;
 app.use(cors());
 app.use(express.json());
 
+// Health check for Docker/Production
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // --- PIPELINE SERVICES ---
 
 interface WineSKU {
@@ -238,137 +243,119 @@ async function verifyDeterministic(sku: WineSKU, imageUrl: string) {
 // D. Playwright Search (Default - Masquerades as Brave/Chrome for scraping)
 async function playwrightSearch(sku: WineSKU) {
   const TRUSTED_DOMAINS = [
-    'wine-searcher.com', 
-    'vivino.com', 
-    'millesima.com', 
-    'idealwine.com', 
-    'wine.com', 
-    'cellartracker.com', 
-    'millesima.co.uk',
-    'klwines.com',
-    'zachys.com',
-    'bbr.com',
-    'vins-etonnants.com',
-    'vinatis.com'
+    'wine-searcher.com', 'vivino.com', 'millesima.com', 'idealwine.com', 'wine.com', 
+    'cellartracker.com', 'bbr.com', 'vins-etonnants.com', 'vinatis.com'
   ];
-
-  const queries = [
-    `${sku.wine_name} ${sku.vintage} wine searcher`,
-    `${sku.wine_name} ${sku.vintage} vivino photo`,
-    `${sku.wine_name} ${sku.vintage} bottle label`,
-    `${sku.wine_name.split(' ').slice(0, 4).join(' ')} wine`
-  ].filter(q => q.trim().length > 0);
-
-  const BAD_DOMAINS = ['pinterest.com', 'shutterstock.com', 'stock.adobe.com', 'alamy.com', 'dreamstime.com', '123rf.com', 'canva.com', 'ebay.com', 'etsy.com', 'facebook.com', 'instagram.com'];
-  const allResults: any[] = [];
+  const BAD_DOMAINS = ['pinterest.com', 'shutterstock.com', 'stock.adobe.com', 'alamy.com', 'ebay.com', 'facebook.com', 'instagram.com'];
+  const allCandidates: any[] = [];
   
   try {
     const browser = await chromium.launch({ 
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox']
     });
+    
     try {
       const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
       });
-      const page = await context.newPage();
+      
+      const query = `${sku.wine_name} ${sku.vintage} wine bottle shot`;
+      console.log(`[DeepRetrieval] Starting: ${query}`);
+      
+      const searchPage = await context.newPage();
+      // Using Bing as recommended in the plan for cleaner scraping
+      const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+      await searchPage.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      
+      // Dismiss popups heuristic from plan
+      await searchPage.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button, a'));
+        const closeBtn = buttons.find(b => /accept|agree|allow|close|dismiss/i.test(b.textContent || ''));
+        if (closeBtn instanceof HTMLElement) closeBtn.click();
+      });
 
-      for (const q of queries) {
-        console.log(`[Playwright] Attempting Query: ${q}`);
+      // Extract search result links
+      const resultLinks = await searchPage.evaluate(({ trusted, bad }) => {
+        const anchors = Array.from(document.querySelectorAll('a[href^="http"]'));
+        const seen = new Set();
+        return anchors.map(a => {
+          const url = a.getAttribute('href') || '';
+          const hostname = new URL(url).hostname.replace('www.', '');
+          if (seen.has(url)) return null;
+          if (hostname.includes('bing.com') || hostname.includes('microsoft.com')) return null;
+          if (bad.some(d => hostname.includes(d))) return null;
+          seen.add(url);
+          
+          let score = 5;
+          if (trusted.some(d => hostname.includes(d))) score = 10;
+          return { url, domain: hostname, score };
+        }).filter(r => r !== null).slice(0, 6); // Top 6 leads
+      }, { trusted: TRUSTED_DOMAINS, bad: BAD_DOMAINS });
+
+      await searchPage.close();
+
+      // Deep Crawl Top Leads (Concurrency limit 3)
+      const leads = resultLinks as any[];
+      for (const lead of leads) {
+        console.log(`[DeepRetrieval] Crawling Lead: ${lead.domain}`);
+        const page = await context.newPage();
         try {
-          const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(q)}&iax=images&ia=images`;
-          await page.goto(searchUrl, { 
-            waitUntil: 'networkidle',
-            timeout: 15000 
-          });
+          await page.goto(lead.url, { waitUntil: 'domcontentloaded', timeout: 12000 });
           
-          // Debug check
-          const pageTitle = await page.title();
-          console.log(`[Playwright] Page Title: ${pageTitle}`);
-
-          // Give extra time for images to populate
-          await page.waitForTimeout(2000);
-          
-          await page.evaluate(() => {
-            window.scrollBy(0, 1000);
-            return new Promise(r => setTimeout(r, 500));
-          });
-          
-          const res = await page.evaluate(({ badDomains, trusted }) => {
-            function getAbsoluteUrl(url: string) {
-              if (!url) return '';
-              if (url.startsWith('http')) return url;
-              if (url.startsWith('//')) return 'https:' + url;
-              if (url.startsWith('/')) return 'https://duckduckgo.com' + url;
-              return url;
-            }
-
-            // Broad discovery
-            const imgElements = Array.from(document.querySelectorAll('img')).filter(img => {
-              const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-              return (src.includes('duckduckgo.com/iu') || src.includes('bing.com')) && img.width > 20 && img.height > 20;
-            });
-
-            console.log(`Found ${imgElements.length} potential images on page`);
-
-            return imgElements.map(img => {
-              const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
-              if (!src || src.includes('data:image')) return null;
-
-              // Find nearest link to determine domain
-              let parent = img.parentElement;
-              let url = '';
-              let domain = 'unknown';
+          const images = await page.evaluate(({ domain, authority }) => {
+            const imgs = Array.from(document.querySelectorAll('img'));
+            return imgs.map((img, i) => {
+              const src = img.getAttribute('src') || img.getAttribute('data-src');
+              if (!src || src.startsWith('data:') || src.length < 10) return null;
               
-              for (let i = 0; i < 5; i++) {
-                 if (!parent) break;
-                 const link = parent.querySelector('a');
-                 if (link) {
-                    url = getAbsoluteUrl(link.getAttribute('href') || '');
-                    try { if(url) domain = new URL(url).hostname; } catch(e){}
-                    break;
-                 }
-                 parent = parent.parentElement;
-              }
-              
-              if (badDomains.some((d: string) => domain.includes(d))) return null;
+              const width = img.naturalWidth || parseInt(img.getAttribute('width') || '0');
+              const height = img.naturalHeight || parseInt(img.getAttribute('height') || '0');
+              const alt = (img.getAttribute('alt') || '').toLowerCase();
+              const urlLower = src.toLowerCase();
 
-              let authority = 3;
-              if (trusted.some((d: string) => domain.includes(d))) authority = 10;
+              // Scoring heuristic from Python Plan
+              let score = authority;
+              if (height > width) score += 3; // Prefer vertical bottle shots
+              if (height > 500) score += 2;
               
+              const hints = ['bottle', 'wine', 'vin', 'product', 'label'];
+              if (hints.some(h => alt.includes(h) || urlLower.includes(h))) score += 3;
+
+              // Absolute URL resolution
+              let finalSrc = src;
+              if (finalSrc.startsWith('//')) finalSrc = 'https:' + finalSrc;
+              else if (finalSrc.startsWith('/')) finalSrc = window.location.origin + finalSrc;
+
               return {
-                original: getAbsoluteUrl(src),
-                title: img.getAttribute('alt') || 'Wine Candidate',
-                url: url,
+                original: finalSrc,
+                title: img.getAttribute('alt') || 'Wine Bottle',
                 domain: domain,
-                authority: authority,
-                source: 'DDG Scraper'
+                authority: score,
+                source: 'Deep Crawl'
               };
-            }).filter((r): r is any => r !== null).slice(0, 10);
-          }, { badDomains: BAD_DOMAINS, trusted: TRUSTED_DOMAINS });
-          
-          if (res && Array.isArray(res) && res.length > 0) {
-            console.log(`[Playwright] Found ${res.length} candidates for query: ${q}`);
-            allResults.push(...res);
-            if (res.some((r: any) => r.authority === 10)) {
-               console.log(`[Playwright] Found trusted results, stopping early.`);
-               break;
-            }
-          }
-        } catch (e: any) {
-          console.warn(`DDG partial failure: ${e.message}`);
+            }).filter(img => img !== null).sort((a,b) => b.authority - a.authority).slice(0, 3);
+          }, { domain: lead.domain, authority: lead.score });
+
+          if (images) allCandidates.push(...images);
+        } catch (e) {
+          console.warn(`[DeepRetrieval] Lead ${lead.domain} failed:`, e);
+        } finally {
+          await page.close();
         }
+        if (allCandidates.some(c => c.authority >= 15)) break; // Found a high-confidence high-res link
       }
     } finally {
       await browser.close().catch(() => {});
     }
 
-    console.log(`[Playwright] Total candidates found: ${allResults.length}`);
-    return allResults
+    console.log(`[DeepRetrieval] Found ${allCandidates.length} potential images.`);
+    return allCandidates
       .sort((a, b) => b.authority - a.authority)
       .filter((r, i, self) => r.original && self.findIndex(t => t.original === r.original) === i);
+
   } catch (error: any) {
-    console.error("[Playwright] Search engine failure:", error.message);
+    console.error("[DeepRetrieval] Failure:", error.message);
     return [];
   }
 }
@@ -592,9 +579,28 @@ async function start() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running at http://0.0.0.0:${PORT}`);
+    console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
   });
+
+  // Graceful shutdown
+  const shutdown = () => {
+    console.log('Shutting down gracefully...');
+    server.close(() => {
+      console.log('Server closed.');
+      process.exit(0);
+    });
+    
+    // Force close after 10s
+    setTimeout(() => {
+      console.error('Forced shutdown.');
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 start();
