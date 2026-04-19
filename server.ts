@@ -1,8 +1,6 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import fs from 'fs/promises';
-import { fileURLToPath } from 'url';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
@@ -14,8 +12,9 @@ import { scrapeAllWines } from './src/services/vinobuzzScraper.js';
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Use process.cwd() for path resolution — works in both ESM (tsx dev) and CJS (bundled prod).
+// import.meta.url is stripped to undefined when esbuild bundles ESM → CJS.
+const APP_ROOT = process.cwd();
 
 const app = express();
 const PORT = 3000;
@@ -959,15 +958,17 @@ async function start() {
   }
 
   if (process.env.NODE_ENV !== 'production') {
+    // Lazy-load vite so it never touches production bundles
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, 'dist')));
+    app.use(express.static(path.join(APP_ROOT, 'dist')));
     app.get('*', (req, res) => {
-      res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+      res.sendFile(path.join(APP_ROOT, 'dist', 'index.html'));
     });
   }
 
