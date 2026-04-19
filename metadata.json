@@ -1,0 +1,6 @@
+{
+  "name": "VinoBuzz Photo Pipeline",
+  "description": "High-accuracy wine photo sourcing and verification system using Gemini AI for visual identity matching.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
