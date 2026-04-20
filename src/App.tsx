@@ -1190,36 +1190,40 @@ export default function App() {
                                   <p className="text-[11px] font-mono text-text-sub uppercase truncate opacity-60">
                                     {run.input.appellation} • {run.input.vineyard || 'No Specific Vineyard'} • {run.input.classification || 'Unclassified'}
                                   </p>
-                                  <div className="mt-4 p-4 bg-bg-app rounded text-[10px] leading-relaxed font-mono border-l-2 border-black relative">
-                                    <div className="absolute top-2 right-2 flex gap-2">
-                                       <button 
-                                         onClick={() => {
-                                           const newResults = [...batchResults];
-                                           newResults[idx].user_verified = 'CORRECT';
-                                           setBatchResults(newResults);
-                                         }}
-                                         className={cn(
-                                           "px-2 py-1 rounded border text-[8px] font-black uppercase transition-all",
-                                           run.user_verified === 'CORRECT' ? "bg-success-green text-white border-success-green" : "bg-white border-border-subtle text-text-sub hover:border-success-green"
-                                         )}
-                                       >
-                                          Confirm
-                                       </button>
-                                       <button 
-                                         onClick={() => {
-                                           const newResults = [...batchResults];
-                                           newResults[idx].user_verified = 'INCORRECT';
-                                           setBatchResults(newResults);
-                                         }}
-                                         className={cn(
-                                           "px-2 py-1 rounded border text-[8px] font-black uppercase transition-all",
-                                           run.user_verified === 'INCORRECT' ? "bg-error-red text-white border-error-red" : "bg-white border-border-subtle text-text-sub hover:border-error-red"
-                                         )}
-                                       >
-                                          Flag Incorrect
-                                       </button>
-                                    </div>
-                                    <span className="font-black text-black">PIPELINE VERIFICATION:</span> {run.explanation}
+                                  <div className="mt-4 p-4 bg-bg-app rounded text-[12px] leading-relaxed border-l-2 border-black">
+                                    <div className="text-[9px] font-black uppercase tracking-widest text-black mb-2">Pipeline Verification</div>
+                                    <p className="whitespace-pre-wrap break-words text-text-main">
+                                      {run.explanation}
+                                    </p>
+                                  </div>
+                                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                                     <span className="text-[9px] font-black uppercase tracking-widest text-text-sub mr-1">Human review:</span>
+                                     <button
+                                       onClick={() => {
+                                         const newResults = [...batchResults];
+                                         newResults[idx].user_verified = 'CORRECT';
+                                         setBatchResults(newResults);
+                                       }}
+                                       className={cn(
+                                         "px-3 py-1.5 rounded border text-[10px] font-black uppercase tracking-widest transition-all",
+                                         run.user_verified === 'CORRECT' ? "bg-success-green text-white border-success-green" : "bg-white border-border-subtle text-text-sub hover:border-success-green"
+                                       )}
+                                     >
+                                        Confirm
+                                     </button>
+                                     <button
+                                       onClick={() => {
+                                         const newResults = [...batchResults];
+                                         newResults[idx].user_verified = 'INCORRECT';
+                                         setBatchResults(newResults);
+                                       }}
+                                       className={cn(
+                                         "px-3 py-1.5 rounded border text-[10px] font-black uppercase tracking-widest transition-all",
+                                         run.user_verified === 'INCORRECT' ? "bg-error-red text-white border-error-red" : "bg-white border-border-subtle text-text-sub hover:border-error-red"
+                                       )}
+                                     >
+                                        Flag Incorrect
+                                     </button>
                                   </div>
                                </div>
                                <div className="w-full md:w-[240px] p-4 bg-bg-app flex flex-col items-center justify-center gap-3">

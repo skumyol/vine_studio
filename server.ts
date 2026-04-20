@@ -733,7 +733,13 @@ INSTRUCTIONS:
 1. Read the label in the image directly (do not rely solely on the OCR).
 2. Treat owner/producer name variants as matches (e.g., "Stéphane Robert" = "Domaine du Tunnel", "Colette Faller" = "Domaine Weinbach").
 3. VINTAGE is critical — if a different year is clearly visible, it is NO_MATCH. "NV" matches non-vintage champagnes.
-4. APPELLATION + VINEYARD/CLIMAT must align with the target (Burgundy climats are strict — "Latricières" ≠ "Mazis").
+4. APPELLATION + VINEYARD/CLIMAT must align semantically with the target. The *identity* of the appellation/climat matters, NOT its punctuation or spelling style. Treat these as IDENTICAL:
+   - Hyphens vs spaces vs en-dashes: "Charmes-Chambertin" = "Charmes Chambertin" = "Charmes–Chambertin".
+   - Accent/diacritic differences: "Latricières" = "Latricieres"; "Côte" = "Cote".
+   - Apostrophes / quotes: "Monts Luisants" = "Monts-Luisants" = "Monts'Luisants".
+   - Abbreviations: "St" = "Saint"; "1er Cru" = "Premier Cru".
+   - Case differences.
+   Only flag a mismatch when the underlying *name* is different (e.g., "Latricières" ≠ "Mazis", "Charmes" ≠ "Chapelle").
 5. Reject lifestyle shots, watermarks, stock images, or images where the label is not readable.
 
 Return strict JSON:
