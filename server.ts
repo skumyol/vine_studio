@@ -966,11 +966,19 @@ async function start() {
     });
     app.use(vite.middlewares);
   } else {
-    // Serve static files under /wine/ base path (matches nginx location)
+    // Serve static files under /wine/ base path (matches nginx location with trailing slash)
     app.use('/wine', express.static(path.join(APP_ROOT, 'dist')));
     // Serve wines.json from public/data (persists between restarts via volume)
     app.use('/wine/data', express.static(path.join(APP_ROOT, 'public', 'data')));
     app.get('/wine/*', (req, res) => {
+      res.sendFile(path.join(APP_ROOT, 'dist', 'index.html'));
+    });
+    // Also handle root when nginx strips the /wine prefix (trailing slash proxy_pass)
+    app.use(express.static(path.join(APP_ROOT, 'dist')));
+    app.get('/', (req, res) => {
+      res.sendFile(path.join(APP_ROOT, 'dist', 'index.html'));
+    });
+    app.get('/*', (req, res) => {
       res.sendFile(path.join(APP_ROOT, 'dist', 'index.html'));
     });
   }
