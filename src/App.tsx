@@ -38,13 +38,14 @@ interface WineSKU {
 interface AnalysisResult {
   id: string;
   input: WineSKU;
-  verdict: 'PASS' | 'FAIL' | 'NO_IMAGE';
+  verdict: 'PASS' | 'FAIL' | 'NO_IMAGE' | 'FAILED';
   confidence: number;
   selected_image_url: string | null;
   explanation: string;
   candidates: any[];
   timestamp: string;
   user_verified?: 'CORRECT' | 'INCORRECT' | 'PENDING';
+  error?: string;
 }
 
 interface MarketWine {
@@ -239,30 +240,76 @@ export default function App() {
     
     // 2. VLM Decision Maker (backend: OCR-hinted Qwen VL verdict)
     if (analyzerMode === 'vlm') {
-      try {
-        const vlmRes = await fetch('api/verify-vlm', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sku, imageUrl }),
-        });
-        const vlmData = await vlmRes.json();
+      let lastError: any;
+      // Retry up to 2 times for transient failures (network, timeout, 5xx)
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 90000); // 90s timeout for VLM
+          
+          const vlmRes = await fetch('api/verify-vlm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sku, imageUrl }),
+            signal: controller.signal
+          });
+          clearTimeout(timeout);
+          
+          if (!vlmRes.ok) {
+            const status = vlmRes.status;
+            // Retry on 5xx or 429 rate limit
+            if ((status >= 500 || status === 429) && attempt < 2) {
+              const delay = 2000 * Math.pow(2, attempt);
+              console.warn(`[VLM] HTTP ${status}, retrying in ${delay}ms (attempt ${attempt + 1})`);
+              await new Promise(r => setTimeout(r, delay));
+              continue;
+            }
+            throw new Error(`HTTP ${status}`);
+          }
+          
+          const vlmData = await vlmRes.json();
+          
+          // Check if backend reported circuit breaker open
+          if (vlmData.fallback_available) {
+            return { 
+              pass: false, 
+              confidence: 0, 
+              reasoning: vlmData.reasoning || "VLM service unavailable (circuit breaker). Switch to OCR/HYBRID mode or retry later." 
+            };
+          }
 
-        // VLM is the decision maker — its confidence + quality is the final score
-        scores.vlm = Math.round((vlmData.confidence || 0) * 0.9);
-        compositeScore = scores.vlm + scores.authority + scores.quality;
+          // VLM is the decision maker — its confidence + quality is the final score
+          scores.vlm = Math.round((vlmData.confidence || 0) * 0.9);
+          compositeScore = scores.vlm + scores.authority + scores.quality;
 
-        return {
-          pass: vlmData.verdict === 'PASS',
-          confidence: Math.min(Math.round(compositeScore), 100),
-          reasoning: vlmData.reasoning || "VLM verification",
-          meta: scores,
-          vlm_text: vlmData.ocr_hint || "",
-          vlm_decision: vlmData.vlm_decision
-        };
-      } catch (e) {
-        console.error("VLM Error:", e);
-        return { pass: false, confidence: 0, reasoning: "VLM verification failed." };
+          return {
+            pass: vlmData.verdict === 'PASS',
+            confidence: Math.min(Math.round(compositeScore), 100),
+            reasoning: vlmData.reasoning || "VLM verification",
+            meta: scores,
+            vlm_text: vlmData.ocr_hint || "",
+            vlm_decision: vlmData.vlm_decision
+          };
+        } catch (e: any) {
+          lastError = e;
+          const isTimeout = e.name === 'AbortError';
+          const isNetwork = !e.status && !e.response;
+          
+          if ((isTimeout || isNetwork) && attempt < 2) {
+            const delay = 2000 * Math.pow(2, attempt);
+            console.warn(`[VLM] ${isTimeout ? 'Timeout' : 'Network error'}, retrying in ${delay}ms (attempt ${attempt + 1})`);
+            await new Promise(r => setTimeout(r, delay));
+            continue;
+          }
+          break; // No more retries
+        }
       }
+      console.error("VLM Error after retries:", lastError);
+      return { 
+        pass: false, 
+        confidence: 0, 
+        reasoning: `VLM verification failed after 3 attempts: ${lastError?.message || 'Unknown error'}` 
+      };
     }
 
     // Legacy: OCR (Deterministic) - Only 20% weight
@@ -370,24 +417,71 @@ export default function App() {
        try {
          setBatchStage(`Searching candidates (${i + 1}/${testItems.length})`);
          setBatchCandidateInfo('Bing multi-query + vintage-aware ranking');
-         const searchRes = await fetch('api/search', {
-           method: 'POST',
-           headers: { 'Content-Type': 'application/json' },
-           body: JSON.stringify(sku)
-         });
-         const data = await searchRes.json();
-         const candidates = data.candidates || [];
+         
+         // Search with timeout and retry at fetch level
+         const searchController = new AbortController();
+         const searchTimeout = setTimeout(() => searchController.abort(), 30000);
+         
+         let candidates: any[] = [];
+         let searchError: string | null = null;
+         
+         try {
+           const searchRes = await fetch('api/search', {
+             method: 'POST',
+             headers: { 'Content-Type': 'application/json' },
+             body: JSON.stringify(sku),
+             signal: searchController.signal
+           });
+           clearTimeout(searchTimeout);
+           
+           if (!searchRes.ok) {
+             searchError = `Search HTTP ${searchRes.status}`;
+           } else {
+             const data = await searchRes.json();
+             candidates = data.candidates || [];
+           }
+         } catch (fetchErr: any) {
+           searchError = fetchErr.name === 'AbortError' ? 'Search timeout (30s)' : fetchErr.message;
+         }
+
+         // If search failed or returned no candidates, record and continue
+         if (searchError || candidates.length === 0) {
+           results.push({
+             id: Math.random().toString(36).substring(7),
+             input: sku,
+             verdict: searchError ? 'FAILED' : 'NO_IMAGE',
+             confidence: 0,
+             selected_image_url: null,
+             explanation: searchError || "No candidates found in search.",
+             candidates: [],
+             timestamp: new Date().toISOString(),
+             user_verified: 'PENDING',
+             error: searchError
+           });
+           setBatchResults([...results]);
+           continue;
+         }
 
          const validCandidates = [];
          const topN = Math.min(candidates.length, 5);
+         let verificationError: string | null = null;
+         
          // Test top 5 candidates per SKU — vintage-correct photo may not be rank #1
          for (let ci = 0; ci < topN; ci++) {
             const c = candidates[ci];
             setBatchStage(`Verifying candidate ${ci + 1}/${topN}`);
             setBatchCandidateInfo(`${c.domain || 'unknown'} · auth ${c.authority}`);
-            const v = await verifyCandidate(sku, c.original, c.authority || 5);
-            validCandidates.push({ ...c, ...v });
-            if (v.pass) break; // Found a good one!
+            
+            try {
+              const v = await verifyCandidate(sku, c.original, c.authority || 5);
+              validCandidates.push({ ...c, ...v });
+              if (v.pass) break; // Found a good one!
+            } catch (verifyErr: any) {
+              // Log but continue to next candidate - don't let one bad candidate kill the SKU
+              console.warn(`[Batch] Candidate ${ci + 1} verification failed:`, verifyErr.message);
+              verificationError = verifyErr.message;
+              validCandidates.push({ ...c, pass: false, confidence: 0, reasoning: `Verify error: ${verifyErr.message}` });
+            }
          }
 
          // Prefer any PASS over any non-PASS, then rank by confidence.
@@ -403,18 +497,126 @@ export default function App() {
            verdict: bestCandidate?.pass ? 'PASS' : (bestCandidate ? 'FAIL' : 'NO_IMAGE'),
            confidence: bestCandidate?.confidence || 0,
            selected_image_url: bestCandidate?.original || null,
-           explanation: bestCandidate?.reasoning || "No candidate found.",
+           explanation: bestCandidate?.reasoning || (verificationError ? `Verification issues: ${verificationError}` : "No candidate passed verification."),
            candidates: validCandidates,
            timestamp: new Date().toISOString(),
            user_verified: 'PENDING'
          });
          setBatchResults([...results]);
-       } catch (e) {
-          console.error(e);
+       } catch (e: any) {
+          // Catch-all for unexpected errors - record FAILED status so user can retry
+          console.error(`[Batch] SKU ${sku.wine_name} failed:`, e);
+          results.push({
+            id: Math.random().toString(36).substring(7),
+            input: sku,
+            verdict: 'FAILED',
+            confidence: 0,
+            selected_image_url: null,
+            explanation: `Unexpected error: ${e.message || 'Unknown error'}. Click to retry.`,
+            candidates: [],
+            timestamp: new Date().toISOString(),
+            user_verified: 'PENDING',
+            error: e.message
+          });
+          setBatchResults([...results]);
        }
        setBatchProgress(Math.round(((i+1)/testItems.length)*100));
     }
     setBatchStage('Complete');
+    setBatchCurrentSku('');
+    setBatchCandidateInfo('');
+    setIsBatchRunning(false);
+  };
+
+  // Retry failed SKUs from a previous batch run
+  const retryFailedSkus = async (failedResults: AnalysisResult[]) => {
+    if (failedResults.length === 0) return;
+    
+    setIsBatchRunning(true);
+    const results = [...batchResults];
+    const existingIds = new Set(results.map(r => r.id));
+    
+    for (let i = 0; i < failedResults.length; i++) {
+      const failed = failedResults[i];
+      const sku = failed.input;
+      
+      setBatchCurrentSku(`${sku.wine_name} (${sku.vintage}) [Retry ${i + 1}/${failedResults.length}]`);
+      setBatchStage(`Retrying failed SKU (${i + 1}/${failedResults.length})`);
+      setBatchCandidateInfo('Searching with fresh queries...');
+      
+      try {
+        // Remove the old failed entry
+        const idx = results.findIndex(r => r.id === failed.id);
+        if (idx >= 0) results.splice(idx, 1);
+        
+        // Re-run search + verification
+        const searchRes = await fetch('api/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(sku)
+        });
+        const data = await searchRes.json();
+        const candidates = data.candidates || [];
+
+        if (candidates.length === 0) {
+          results.push({
+            ...failed,
+            verdict: 'NO_IMAGE',
+            explanation: 'Retry: Still no candidates found.',
+            timestamp: new Date().toISOString()
+          });
+          setBatchResults([...results]);
+          continue;
+        }
+
+        const validCandidates = [];
+        const topN = Math.min(candidates.length, 5);
+        
+        for (let ci = 0; ci < topN; ci++) {
+          const c = candidates[ci];
+          setBatchStage(`Retry verify ${ci + 1}/${topN}`);
+          setBatchCandidateInfo(`${c.domain || 'unknown'}`);
+          try {
+            const v = await verifyCandidate(sku, c.original, c.authority || 5);
+            validCandidates.push({ ...c, ...v });
+            if (v.pass) break;
+          } catch (verifyErr: any) {
+            validCandidates.push({ ...c, pass: false, confidence: 0, reasoning: `Retry error: ${verifyErr.message}` });
+          }
+        }
+
+        const bestCandidate = validCandidates.sort((a, b) => {
+          if (a.pass !== b.pass) return a.pass ? -1 : 1;
+          return b.confidence - a.confidence;
+        })[0];
+
+        results.push({
+          id: Math.random().toString(36).substring(7),
+          input: sku,
+          verdict: bestCandidate?.pass ? 'PASS' : (bestCandidate ? 'FAIL' : 'NO_IMAGE'),
+          confidence: bestCandidate?.confidence || 0,
+          selected_image_url: bestCandidate?.original || null,
+          explanation: bestCandidate?.reasoning || `Retry completed: ${bestCandidate ? 'No PASS candidate' : 'No candidates'}`,
+          candidates: validCandidates,
+          timestamp: new Date().toISOString(),
+          user_verified: 'PENDING'
+        });
+        setBatchResults([...results]);
+      } catch (e: any) {
+        console.error(`[Retry] SKU ${sku.wine_name} failed again:`, e);
+        // Keep the failed status
+        results.push({
+          ...failed,
+          explanation: `Retry also failed: ${e.message || 'Unknown error'}`,
+          timestamp: new Date().toISOString()
+        });
+        setBatchResults([...results]);
+      }
+      
+      setBatchProgress(Math.round(((i + 1) / failedResults.length) * 100));
+    }
+    
+    setBatchStage('Retry Complete');
     setBatchCurrentSku('');
     setBatchCandidateInfo('');
     setIsBatchRunning(false);
@@ -497,7 +699,8 @@ export default function App() {
 
   const getStatusColor = (v: string) => {
     if (v === 'PASS') return 'text-success-green bg-success-green/10 border-success-green/20';
-    if (v === 'FAIL') return 'text-error-red bg-error-red/10 border-error-red/40';
+    if (v === 'FAIL' || v === 'FAILED') return 'text-error-red bg-error-red/10 border-error-red/40';
+    if (v === 'NO_IMAGE') return 'text-amber-500 bg-amber-500/10 border-amber-500/40';
     return 'text-text-sub bg-bg-app border-border-subtle';
   };
 
@@ -1145,6 +1348,12 @@ export default function App() {
                             {batchResults.length}/10
                           </div>
                        </div>
+                       <div className="p-6 bg-white border border-border-subtle">
+                          <div className="text-[9px] font-black uppercase tracking-widest text-text-sub mb-2">Failed / Errors</div>
+                          <div className="font-display text-5xl leading-none text-error-red">
+                            {batchResults.filter(r => r.verdict === 'FAILED').length}
+                          </div>
+                       </div>
                     </div>
 
                     {/* F1 Metrics Performance Dashboard */}
@@ -1181,12 +1390,29 @@ export default function App() {
                         </div>
                         <div className="mt-8 pt-8 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-4">
                            <p className="text-[10px] font-mono text-white/40 uppercase">Metrics update live as outcomes are verified in the list below.</p>
-                           <button 
-                             onClick={() => setBatchResults([])}
-                             className="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-black uppercase tracking-widest transition-all"
-                           >
-                             Reset Run
-                           </button>
+                           <div className="flex gap-2">
+                             {batchResults.some(r => r.verdict === 'FAILED') && (
+                               <button 
+                                 onClick={() => {
+                                   // Retry only FAILED items
+                                   const failed = batchResults.filter(r => r.verdict === 'FAILED');
+                                   const remaining = batchResults.filter(r => r.verdict !== 'FAILED');
+                                   setBatchResults(remaining);
+                                   // Re-run batch on failed SKUs
+                                   retryFailedSkus(failed);
+                                 }}
+                                 className="px-4 py-2 bg-accent-wine-vibrant hover:bg-white hover:text-black border border-accent-wine-vibrant text-[10px] font-black uppercase tracking-widest transition-all"
+                               >
+                                 Retry Failed ({batchResults.filter(r => r.verdict === 'FAILED').length})
+                               </button>
+                             )}
+                             <button 
+                               onClick={() => setBatchResults([])}
+                               className="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 text-[10px] font-black uppercase tracking-widest transition-all"
+                             >
+                               Reset Run
+                             </button>
+                           </div>
                         </div>
                     </div>
 

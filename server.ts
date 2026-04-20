@@ -16,6 +16,108 @@ dotenv.config();
 // import.meta.url is stripped to undefined when esbuild bundles ESM → CJS.
 const APP_ROOT = process.cwd();
 
+// --- RESILIENCE UTILITIES ---
+
+// Simple circuit breaker for OpenRouter
+const CircuitState = { CLOSED: 0, OPEN: 1, HALF_OPEN: 2 };
+let openRouterCircuit = {
+  state: CircuitState.CLOSED,
+  failures: 0,
+  lastFailure: 0,
+  threshold: 3,           // Open after 3 consecutive failures
+  resetTimeout: 60000,    // Try half-open after 60s
+};
+
+function isCircuitOpen(): boolean {
+  if (openRouterCircuit.state === CircuitState.OPEN) {
+    const now = Date.now();
+    if (now - openRouterCircuit.lastFailure > openRouterCircuit.resetTimeout) {
+      openRouterCircuit.state = CircuitState.HALF_OPEN;
+      console.log('[Circuit] Entering HALF_OPEN state');
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function recordCircuitSuccess() {
+  if (openRouterCircuit.state === CircuitState.HALF_OPEN) {
+    openRouterCircuit.state = CircuitState.CLOSED;
+    openRouterCircuit.failures = 0;
+    console.log('[Circuit] CLOSED (recovered)');
+  } else {
+    openRouterCircuit.failures = Math.max(0, openRouterCircuit.failures - 1);
+  }
+}
+
+function recordCircuitFailure() {
+  openRouterCircuit.failures++;
+  openRouterCircuit.lastFailure = Date.now();
+  if (openRouterCircuit.failures >= openRouterCircuit.threshold) {
+    openRouterCircuit.state = CircuitState.OPEN;
+    console.warn(`[Circuit] OPENED after ${openRouterCircuit.failures} failures`);
+  }
+}
+
+// Exponential backoff retry wrapper
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  options: { retries?: number; baseDelay?: number; maxDelay?: number; label?: string } = {}
+): Promise<T> {
+  const { retries = 2, baseDelay = 1000, maxDelay = 15000, label = 'operation' } = options;
+  let lastError: any;
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const result = await fn();
+      if (attempt > 0) console.log(`[Retry:${label}] Succeeded on attempt ${attempt + 1}`);
+      return result;
+    } catch (err: any) {
+      lastError = err;
+      const isTimeout = err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT';
+      const is5xx = err.response?.status >= 500;
+      const isNetwork = !err.response; // No response = network/DNS failure
+
+      // Don't retry on 4xx client errors (except 429 rate limit)
+      if (err.response?.status >= 400 && err.response?.status < 500 && err.response?.status !== 429) {
+        throw err;
+      }
+
+      if (attempt < retries) {
+        const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
+        console.warn(`[Retry:${label}] Attempt ${attempt + 1} failed (${isTimeout ? 'timeout' : isNetwork ? 'network' : is5xx ? `HTTP ${err.response?.status}` : err.message}). Retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+// Concurrency limiter for parallel operations
+async function withConcurrencyLimit<T>(
+  items: T[],
+  fn: (item: T, index: number) => Promise<any>,
+  limit: number
+): Promise<any[]> {
+  const results: any[] = [];
+  const executing: Promise<void>[] = [];
+
+  for (let i = 0; i < items.length; i++) {
+    const p = Promise.resolve().then(() => fn(items[i], i)).then(r => { results[i] = r; });
+    executing.push(p);
+
+    if (executing.length >= limit) {
+      await Promise.race(executing);
+      executing.splice(executing.findIndex(x => x === p), 1);
+    }
+  }
+
+  await Promise.all(executing);
+  return results;
+}
+
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
@@ -24,7 +126,13 @@ app.use(express.json());
 
 // Health check for Docker/Production
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  const circuitState = ['CLOSED', 'OPEN', 'HALF_OPEN'][openRouterCircuit.state];
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    circuit_breaker: circuitState,
+    circuit_failures: openRouterCircuit.failures
+  });
 });
 
 // --- PIPELINE SERVICES ---
@@ -753,26 +861,41 @@ Return strict JSON:
   "reasoning": "one concise sentence explaining the verdict"
 }`;
 
-  const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
-    model: "qwen/qwen3.5-27b",
-    messages: [{
-      role: "user",
-      content: [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: imageUrl } }
-      ]
-    }],
-    response_format: { type: "json_object" }
-  }, {
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
-      'X-Title': 'VinoBuzz VLM Decision'
-    },
-    timeout: 45000
-  });
+  // Check circuit breaker first
+  if (isCircuitOpen()) {
+    throw new Error('OpenRouter circuit breaker is OPEN - too many recent failures');
+  }
 
-  return JSON.parse(response.data.choices[0].message.content);
+  const doVlmCall = async () => {
+    const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', {
+      model: "qwen/qwen3.5-27b",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: prompt },
+          { type: "image_url", image_url: { url: imageUrl } }
+        ]
+      }],
+      response_format: { type: "json_object" }
+    }, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'HTTP-Referer': process.env.APP_URL || 'http://localhost:3000',
+        'X-Title': 'VinoBuzz VLM Decision'
+      },
+      timeout: 60000  // Increased to 60s for large images
+    });
+    return response;
+  };
+
+  try {
+    const response = await withRetry(doVlmCall, { retries: 2, baseDelay: 2000, label: 'vlmDecide' });
+    recordCircuitSuccess();
+    return JSON.parse(response.data.choices[0].message.content);
+  } catch (err: any) {
+    recordCircuitFailure();
+    throw err;
+  }
 }
 
 // H. VLM-Based Verification (VLM is the final decision maker, OCR provides hint context)
@@ -780,8 +903,12 @@ async function verifyWithVLM(sku: WineSKU, imageUrl: string) {
   console.log(`[VLM Verify] Analyzing image: ${imageUrl}`);
 
   try {
-    const response = await axios.get(imageUrl, { responseType: 'arraybuffer' });
-    const buffer = Buffer.from(response.data);
+    // Fetch image with retry and timeout (images can be large/slow)
+    const imgResponse = await withRetry(
+      () => axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 30000 }),
+      { retries: 2, baseDelay: 1000, label: 'imageFetch' }
+    );
+    const buffer = Buffer.from(imgResponse.data);
 
     // 1. Visual Pre-Filter (only absolute rejects — too blurry / wrong aspect)
     const preFilter = await visualPreFilter(buffer);
@@ -844,6 +971,35 @@ async function verifyWithVLM(sku: WineSKU, imageUrl: string) {
 
   } catch (error: any) {
     console.error("[VLM Verify] Error:", error.message);
+    
+    // Circuit breaker open or VLM failed — fallback to deterministic/OCR mode
+    const isCircuitFailure = error.message?.includes('circuit breaker is OPEN');
+    if (isCircuitFailure) {
+      console.warn('[VLM Verify] Circuit breaker open — falling back to deterministic OCR mode');
+    }
+    
+    // Try deterministic fallback if we have the buffer (image was fetched)
+    // This prevents total failure when OpenRouter is down
+    if (error.message?.includes('circuit') || error.code === 'ECONNABORTED' || !error.response) {
+      try {
+        // We don't have buffer here since we failed before or during VLM call
+        // Just return a graceful failure that allows retry at higher level
+        return {
+          pass: false,
+          confidence: 0,
+          verdict: 'FAIL',
+          reasoning: isCircuitFailure 
+            ? 'VLM service temporarily unavailable (circuit breaker open). Please retry in 60s or switch to OCR/HYBRID mode.'
+            : `VLM verification failed: ${error.message}`,
+          ocr_hint: "",
+          vlm_decision: null,
+          fallback_available: true
+        };
+      } catch (fallbackErr) {
+        // Deterministic also failed
+      }
+    }
+    
     return {
       pass: false,
       confidence: 0,
