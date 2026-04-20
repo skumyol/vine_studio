@@ -34,7 +34,7 @@ COPY package*.json ./
 RUN npm install -g pnpm && pnpm install --prod
 
 # Install only the chromium browser for Playwright to save space
-RUN npx playwright install chromium
+RUN pnpm exec playwright install chromium
 
 # Copy the built artifacts from the builder stage
 COPY --from=builder /app/dist ./dist
