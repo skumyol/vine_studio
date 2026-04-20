@@ -5,9 +5,11 @@ services:
       dockerfile: Dockerfile
       network: host
     container_name: vinobuzz-app
-    network_mode: host
     ports:
       - "3002:3000"
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - NODE_ENV=production
       - PORT=3000
