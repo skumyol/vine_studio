@@ -968,6 +968,8 @@ async function start() {
   } else {
     // Serve static files under /wine/ base path (matches nginx location)
     app.use('/wine', express.static(path.join(APP_ROOT, 'dist')));
+    // Serve wines.json from public/data (persists between restarts via volume)
+    app.use('/wine/data', express.static(path.join(APP_ROOT, 'public', 'data')));
     app.get('/wine/*', (req, res) => {
       res.sendFile(path.join(APP_ROOT, 'dist', 'index.html'));
     });
