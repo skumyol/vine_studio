@@ -89,6 +89,31 @@ export default function App() {
 
   const ai = useMemo(() => new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' }), []);
 
+  // Persistence — survive reloads
+  const LS_BATCH = 'vinobuzz.batchResults.v1';
+  const LS_HISTORY = 'vinobuzz.history.v1';
+
+  // Load once on mount
+  useEffect(() => {
+    try {
+      const b = localStorage.getItem(LS_BATCH);
+      if (b) setBatchResults(JSON.parse(b));
+      const h = localStorage.getItem(LS_HISTORY);
+      if (h) setHistory(JSON.parse(h));
+    } catch (e) {
+      console.warn('Failed to restore persisted state', e);
+    }
+  }, []);
+
+  // Save whenever they change
+  useEffect(() => {
+    try { localStorage.setItem(LS_BATCH, JSON.stringify(batchResults)); } catch {}
+  }, [batchResults]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_HISTORY, JSON.stringify(history)); } catch {}
+  }, [history]);
+
   // Performance Metrics Calculation
   const metrics = useMemo(() => {
     const verified = batchResults.filter(r => r.user_verified && r.user_verified !== 'PENDING');
