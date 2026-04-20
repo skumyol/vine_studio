@@ -6,7 +6,7 @@ WORKDIR /app
 # Install pnpm via standalone installer (force IPv4 for flaky networks)
 RUN apt-get -o Acquire::ForceIPv4=true update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL --ipv4 https://get.pnpm.io/install.sh | sh - && \
+    SHELL=/bin/sh curl -fsSL --ipv4 https://get.pnpm.io/install.sh | sh - && \
     mv /root/.local/share/pnpm/pnpm /usr/local/bin/pnpm && \
     rm -rf /var/lib/apt/lists/*
 
@@ -31,7 +31,7 @@ WORKDIR /app
 # Install curl for healthcheck and pnpm (force IPv4)
 RUN apt-get -o Acquire::ForceIPv4=true update && \
     apt-get install -y --no-install-recommends curl ca-certificates && \
-    curl -fsSL --ipv4 https://get.pnpm.io/install.sh | sh - && \
+    SHELL=/bin/sh curl -fsSL --ipv4 https://get.pnpm.io/install.sh | sh - && \
     mv /root/.local/share/pnpm/pnpm /usr/local/bin/pnpm && \
     rm -rf /var/lib/apt/lists/*
 
