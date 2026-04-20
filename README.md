@@ -6,6 +6,40 @@ Working demo, batch-test UI, and a VLM-centric verification pipeline. See `submi
 
 ---
 
+## 0. Live demo
+
+**👉 [https://skumyol.com/wine/](https://skumyol.com/wine/)**
+
+A hosted instance of the app is running there. No install needed — you can run individual SKU verifications and the **Batch Test (90% Challenge)** straight from the browser.
+
+### Quick tour of the live site
+
+| Tab | What it does |
+| :-- | :-- |
+| **Pipeline** | Enter a wine (producer, vintage, appellation, vineyard, classification) and click **Run Analysis**. Returns a verdict (PASS / FAIL / NO_IMAGE), the selected bottle photo, composite confidence, and a candidate comparison grid. |
+| **Marketplace** | Browse the seeded catalog. Clicking any card auto-fills the Pipeline form — fastest way to try a known-hard SKU. Cards badged `TEST SET` are the 10 challenge wines. |
+| **Batch Test (90% Challenge)** | One-click evaluation over all 10 challenge SKUs. |
+| **Archive** | History of manual runs from the current session. |
+
+### How to run the Batch Analysis on the live site
+
+1. Open **[https://skumyol.com/wine/](https://skumyol.com/wine/)**.
+2. Make sure the left sidebar **Analyzer Engine** toggle is set to **VLM** (default — this is the mode benchmarked to 90%+). `HYBRID` uses Gemini, `OCR` is Tesseract-only baseline.
+3. Click the **Batch Test (90% Challenge)** tab in the top nav.
+4. If the header shows `SKUs: 0`, first go to **Marketplace → REFRESH CATALOG** to load the 10 challenge SKUs, then come back.
+5. Click **START BATCH ANALYSIS**.
+6. Watch the progress panel: it reports the current SKU, stage (searching / verifying candidate `N/5`), and candidate domain + authority in real time. Expect **~2–4 minutes** for all 10 SKUs depending on OpenRouter latency.
+7. When it finishes, each row shows:
+   - **Verdict** (PASS / FAIL) + composite confidence
+   - The **selected bottle image** (with a `View Source` link to the original URL)
+   - A **Pipeline Verification** explanation (the VLM's one-sentence reasoning)
+   - **Confirm / Flag Incorrect** buttons — human review. Clicking these updates the live **Precision / Recall / F1 / Accuracy** panel at the top.
+8. Hit **Reset Run** to clear results and re-run.
+
+> **Note on `NO_IMAGE`:** 1 of the 10 test SKUs (*Arnot-Roberts Trousseau Gris Watson Ranch 2020*) has near-zero online coverage. The pipeline is designed to return `NO_IMAGE` rather than a wrong bottle — this is the **correct** outcome and counts toward the 90%.
+
+---
+
 ## 1. What this does
 
 Given a wine SKU (producer, vintage, appellation, vineyard/climat, classification), the pipeline:
@@ -233,6 +267,8 @@ The Docker image bundles `tessdata/` (all 4 languages) and installs `curl` for t
 
 ### Batch 90% Challenge
 Open UI → **Batch Test (90% Challenge)** tab → **START BATCH ANALYSIS**. Runs `handleBatchTest` over all 10 test wines, top-5 candidates each, writes per-SKU verdict + confidence + selected image + candidate grid. The **Confirm / Flag Incorrect** buttons on each row feed the live **Precision / Recall / F1 / Accuracy** panel.
+
+> You can also run the batch directly on the hosted instance at **[https://skumyol.com/wine/](https://skumyol.com/wine/)** — see the step-by-step walkthrough in [§0 Live demo](#0-live-demo).
 
 ---
 
