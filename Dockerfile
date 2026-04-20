@@ -3,8 +3,11 @@ FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Install pnpm globally
-RUN npm install -g pnpm
+# Install pnpm via standalone installer (more reliable than npm on flaky networks)
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://get.pnpm.io/install.sh | sh - && \
+    mv /root/.local/share/pnpm/pnpm /usr/local/bin/pnpm && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy dependency files
 COPY package*.json ./
@@ -24,14 +27,17 @@ FROM mcr.microsoft.com/playwright:v1.49.1-noble AS runner
 
 WORKDIR /app
 
-# Install curl for healthcheck
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
+# Install curl for healthcheck and pnpm
+RUN apt-get update && apt-get install -y curl && \
+    curl -fsSL https://get.pnpm.io/install.sh | sh - && \
+    mv /root/.local/share/pnpm/pnpm /usr/local/bin/pnpm && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy package files for production install
 COPY package*.json ./
 
-# Install pnpm and production dependencies
-RUN npm install -g pnpm && pnpm install --prod
+# Install production dependencies
+RUN pnpm install --prod
 
 # Install only the chromium browser for Playwright to save space
 RUN pnpm exec playwright install chromium
