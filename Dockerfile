@@ -3,15 +3,18 @@ FROM node:22-slim AS builder
 
 WORKDIR /app
 
+# Install pnpm globally
+RUN npm install -g pnpm
+
 # Copy dependency files
 COPY package*.json ./
-RUN npm install
+RUN pnpm install
 
 # Copy source code
 COPY . .
 
 # Build frontend and backend
-RUN npm run build
+RUN pnpm run build
 
 # --- Production Stage ---
 FROM mcr.microsoft.com/playwright:v1.49.1-noble AS runner
@@ -27,9 +30,8 @@ RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 # Copy package files for production install
 COPY package*.json ./
 
-# Install ONLY production dependencies
-# External dependencies like sharp need to be rebuilt for the linux target if the host was different
-RUN npm install --omit=dev
+# Install pnpm and production dependencies
+RUN npm install -g pnpm && pnpm install --prod
 
 # Install only the chromium browser for Playwright to save space
 RUN npx playwright install chromium
@@ -48,4 +50,4 @@ ENV PORT=3000
 EXPOSE 3000
 
 # Start the application
-CMD ["npm", "start"]
+CMD ["pnpm", "start"]
