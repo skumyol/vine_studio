@@ -125,7 +125,7 @@ export default function App() {
   useEffect(() => {
     const loadMarket = async () => {
       try {
-        const res = await fetch('/data/wines.json');
+        const res = await fetch('data/wines.json');
         if (res.ok) {
           const data = await res.json();
           setMarketWines(data);
@@ -142,10 +142,10 @@ export default function App() {
   const handleRefreshMarket = async () => {
     setIsRefreshingMarket(true);
     try {
-      const res = await fetch('/api/refresh-wines', { method: 'POST' });
+      const res = await fetch('api/refresh-wines', { method: 'POST' });
       const result = await res.json();
       if (result.success) {
-        const fresh = await fetch('/data/wines.json').then(r => r.json());
+        const fresh = await fetch('data/wines.json').then(r => r.json());
         setMarketWines(fresh);
       }
     } catch (e) {
@@ -202,7 +202,7 @@ export default function App() {
     const scores = { vision: 0, vlm: 0, ocr: 0, authority: authorityScore, quality: 0 };
     
     // 1. Quality check (always run via deterministic pre-filter)
-    const detRes = await fetch('/api/verify-deterministic', {
+    const detRes = await fetch('api/verify-deterministic', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sku, imageUrl }),
@@ -215,7 +215,7 @@ export default function App() {
     // 2. VLM Decision Maker (backend: OCR-hinted Qwen VL verdict)
     if (analyzerMode === 'vlm') {
       try {
-        const vlmRes = await fetch('/api/verify-vlm', {
+        const vlmRes = await fetch('api/verify-vlm', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ sku, imageUrl }),
@@ -247,7 +247,7 @@ export default function App() {
     if (analyzerMode === 'gemini') {
       try {
         // Use proxy to avoid CORS and get base64
-        const proxyRes = await fetch(`/api/proxy-image?url=${encodeURIComponent(imageUrl)}`);
+        const proxyRes = await fetch(`api/proxy-image?url=${encodeURIComponent(imageUrl)}`);
         const { base64, contentType } = await proxyRes.json();
 
         const prompt = `Perform a high-integrity wine label verification.
@@ -345,7 +345,7 @@ export default function App() {
        try {
          setBatchStage(`Searching candidates (${i + 1}/${testItems.length})`);
          setBatchCandidateInfo('Bing multi-query + vintage-aware ranking');
-         const searchRes = await fetch('/api/search', {
+         const searchRes = await fetch('api/search', {
            method: 'POST',
            headers: { 'Content-Type': 'application/json' },
            body: JSON.stringify(sku)
@@ -403,7 +403,7 @@ export default function App() {
     setCurrentResult(null);
 
     try {
-      const searchRes = await fetch('/api/search', {
+      const searchRes = await fetch('api/search', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 

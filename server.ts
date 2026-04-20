@@ -966,8 +966,9 @@ async function start() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(APP_ROOT, 'dist')));
-    app.get('*', (req, res) => {
+    // Serve static files under /wine/ base path (matches nginx location)
+    app.use('/wine', express.static(path.join(APP_ROOT, 'dist')));
+    app.get('/wine/*', (req, res) => {
       res.sendFile(path.join(APP_ROOT, 'dist', 'index.html'));
     });
   }
