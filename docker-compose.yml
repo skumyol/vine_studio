@@ -5,11 +5,10 @@ services:
       dockerfile: Dockerfile
       network: host
     container_name: vinobuzz-app
-    ports:
-      - "3002:3000"
+    network_mode: host
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - PORT=3002
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - SERPAPI_KEY=${SERPAPI_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -19,7 +18,7 @@ services:
     volumes:
       - wine-data:/app/public/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:3002/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -33,7 +32,3 @@ services:
 
 volumes:
   wine-data:
-
-networks:
-  default:
-    name: vinobuzz-network
