@@ -3,13 +3,8 @@ FROM node:22-slim AS builder
 
 WORKDIR /app
 
-# Install pnpm via standalone installer (force IPv4 for flaky networks)
-RUN apt-get -o Acquire::ForceIPv4=true update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
-    export SHELL=/bin/sh && \
-    curl -fsSL --ipv4 https://get.pnpm.io/install.sh | sh - && \
-    mv /root/.local/share/pnpm/pnpm /usr/local/bin/pnpm && \
-    rm -rf /var/lib/apt/lists/*
+# Install pnpm via npm
+RUN npm install -g pnpm
 
 # Copy dependency files
 COPY package*.json ./
@@ -29,12 +24,10 @@ FROM mcr.microsoft.com/playwright:v1.49.1-noble AS runner
 
 WORKDIR /app
 
-# Install curl for healthcheck and pnpm (force IPv4)
-RUN apt-get -o Acquire::ForceIPv4=true update && \
-    apt-get install -y --no-install-recommends curl ca-certificates && \
-    export SHELL=/bin/sh && \
-    curl -fsSL --ipv4 https://get.pnpm.io/install.sh | sh - && \
-    mv /root/.local/share/pnpm/pnpm /usr/local/bin/pnpm && \
+# Install curl for healthcheck and pnpm
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    npm install -g pnpm && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy package files for production install
